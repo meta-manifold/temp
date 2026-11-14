@@ -1,0 +1,142 @@
+/*=============================================================================
+ vecm.comp: vec.comp for M = 1 .. 8 rows of I: each 16 B chunk of W, read
+     once, feeds the M rows' accumulators (as linear-slab feeds M dot chains);
+     the rows fold one after another through the same shared memory
+
+     O[m, n] = sum_k I[m, k] * W[n, k]
+
+     O [M, N] (or split-K partials P[z, M, N]) and I [M, K] are fp32 or fp16,
+     W fp16 or fp32, via same-binding buffer aliases; accumulation is fp32.
+
+ Packed W: 32-column blocks, each a contiguous run of K pairs x 64 values,
+ W'[n / 32, k / 2, n % 16, (k % 2) * 2 + (n % 32) / 16]. A workgroup of WG
+ threads owns one block (and one K span under split-K) and reads it in 16 B
+ chunks, 8 values each, contiguous across the workgroup. Chunk c of a k pair
+ always holds columns 2c, 2c + 16, 2c + 1 and 2c + 17 (lanes 2c and 2c + 1 of
+ linear-tile-intel), so thread t keeps chunk c = t % 8 and sums those four
+ columns over the k pairs r, r + WG / 8, ... (r = t / 8).
+
+ Dispatch (host): (ceil(N / 32), 1, splits); splitSize even.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = WG (same SpecId)
+
+layout(constant_id = 0) const uint WG = 128;   // threads per workgroup: 128 .. 1024, a power of 2
+layout(constant_id = 1) const uint splitOnY = 0;   // 1: the split-K index is gl_WorkGroupID.y (walked first), not z
+layout(constant_id = 2) const uint MR = 1;         // rows of I (M), 1 .. 8
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 1;  // W (weight) dtype
+
+const uint ROWS   = WG / 8u;     // k pairs a workgroup reads per step
+const uint SG     = 16u;         // subgroup size (pinned on the pipeline)
+const uint NSG    = WG / SG;    // up to 64
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_2F32 { vec2 bufferI_2f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_2F16 { uint bufferI_2f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer W_BUF_8F16 { uvec4 bufferW_8f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_4F32 { vec4 bufferW_4f32[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;           // = MR
+    uint N;
+    uint K;
+    uint splitSize;   // K span per workgroup z (= K without splitting), even
+};
+
+float readI(uint k) { return (k >= K) ? 0.0 : (typeI == DTYPE_F32) ? bufferI_f32[k] : float(bufferI_f16[k]); }
+
+// Row m's I[2p], I[2p + 1] (K even).
+vec2 readI2(uint m, uint p)
+{
+    const uint q = m * (K / 2u) + p;
+    return (typeI == DTYPE_F32) ? bufferI_2f32[q] : vec2(unpackFloat2x16(bufferI_2f16[q]));
+}
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+shared vec4 sSum[NSG][8];
+
+// Chunk q (8 values) of the packed W: values 0..3 and 4..7 are
+// [k0 g0, k0 g1, k1 g0, k1 g1] of lanes 2c and 2c + 1.
+void readChunk(uint q, out vec4 e0, out vec4 e1)
+{
+    if (typeW == DTYPE_F16)
+    {
+        const uvec4 u = bufferW_8f16[q];
+        e0 = vec4(vec2(unpackFloat2x16(u.x)), vec2(unpackFloat2x16(u.y)));
+        e1 = vec4(vec2(unpackFloat2x16(u.z)), vec2(unpackFloat2x16(u.w)));
+    }
+    else
+    {
+        e0 = bufferW_4f32[2u * q];
+        e1 = bufferW_4f32[2u * q + 1u];
+    }
+}
+
+// The four columns' (2c, 2c + 16, 2c + 1, 2c + 17) share of k pair x.
+vec4 pairDot(vec4 e0, vec4 e1, vec2 x)
+{
+    return vec4(e0.x * x.x + e0.z * x.y, e0.y * x.x + e0.w * x.y, e1.x * x.x + e1.z * x.y, e1.y * x.x + e1.w * x.y);
+}
+
+void accStep(inout vec4 acc[MR], uint q, uint p)
+{
+    vec4 e0, e1;
+    readChunk(q, e0, e1);
+    [[unroll]] for (uint m = 0; m < MR; m++) acc[m] += pairDot(e0, e1, readI2(m, p));
+}
+
+void main()
+{
+    const uint t = gl_LocalInvocationID.x, c = t % 8u, r = t / 8u;
+    const uint blk = gl_WorkGroupID.x, z = (splitOnY != 0u) ? gl_WorkGroupID.y : gl_WorkGroupID.z;
+    const uint kPairs = (K + 1u) / 2u;
+    const uint p0 = z * (splitSize / 2u), p1 = min(kPairs, p0 + splitSize / 2u);
+    const uint base = blk * kPairs * 8u + c;   // chunk index of (k pair 0, chunk c) in the block
+
+    vec4 acc[MR];
+    [[unroll]] for (uint m = 0; m < MR; m++) acc[m] = vec4(0.0);
+    uint p = p0 + r;
+    if (MR <= 2u)
+        for (; p + 7u * ROWS < p1; p += 8u * ROWS)
+            [[unroll]] for (uint u = 0; u < 8u; u++) accStep(acc, base + (p + u * ROWS) * 8u, p + u * ROWS);
+    else
+        for (; p + 3u * ROWS < p1; p += 4u * ROWS)
+            [[unroll]] for (uint u = 0; u < 4u; u++) accStep(acc, base + (p + u * ROWS) * 8u, p + u * ROWS);
+    for (; p < p1; p += ROWS)
+        accStep(acc, base + p * 8u, p);
+
+    // Fold the threads sharing chunk c, row by row: lanes l and l ^ 8, then the subgroups.
+    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
+    [[unroll]] for (uint m = 0; m < MR; m++)
+    {
+        const vec4 a = acc[m] + subgroupShuffleXor(acc[m], 8u);
+        if (lane < 8u) sSum[sg][lane] = a;
+        barrier();
+        if (t < 32u)
+        {
+            const uint cc = t / 4u, j = t % 4u;
+            float s = 0.0;
+            [[unroll]] for (uint g = 0; g < NSG; g++) s += sSum[g][cc][j];
+            const uint col = 2u * cc + ((j == 1u || j == 3u) ? 16u : 0u) + ((j >= 2u) ? 1u : 0u);
+            const uint n = blk * 32u + col;
+            if (n < N) writeO((z * MR + m) * N + n, s);
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,189 @@
+/*=============================================================================
+ attention-fa-intel3.comp: version 3: version 2 with V staged in shared
+     memory too and the PV loop at a fixed trip count (tests/attention-tune-intel)
+
+     Q [B, Hq, Tq, Dh] fp16, K / V [B, Hkv, Tk, Dh] fp16, O [B, Tq, Hq, Dh] fp32.
+
+ One workgroup owns R = TQ tokens x G query heads of one KV head. Per KV
+ block of BK keys:
+   - K stages into shared memory transposed ([Dh/4][BK] of 4-dim slots)
+   - S = Q K^T: the subgroups tile R x BK as (R / TMS) row blocks x the rest
+     key blocks; a subgroup owns TMS rows and 16 * TNS keys (lane l: keys
+     l + 16n). Q slots load from global memory at uniform addresses.
+   - softmax: scores go to shared memory; each subgroup then takes R / NSG
+     rows whole, updates their running max / sum and writes P (fp16) and the
+     rescale factor
+   - O += P V: the subgroups tile R x Dh as (R / TMP) row blocks x head-dim
+     slices; a lane owns OVS 4-dim slots of its slice. P loads at uniform
+     addresses, V straight from global memory (neighbouring lanes, one row).
+ Requirements: wgSize = NSG * 16 forced; TMS, TMP and R / NSG divide R; the
+ S tiling covers BK exactly; BK % 16 == 0; Dh % 4 == 0.
+ Dispatch: (ceil(Tq / TQ), Hkv, B).
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 256;   // threads per workgroup, a multiple of 16
+layout(constant_id = 1) const uint Dh     = 256;   // head dim
+layout(constant_id = 2) const uint G      = 8;     // query heads per KV head handled together
+layout(constant_id = 3) const uint TQ     = 4;     // query tokens per workgroup
+layout(constant_id = 4) const uint BK     = 64;    // keys per block
+layout(constant_id = 5) const uint TMS    = 8;     // S: rows per subgroup
+layout(constant_id = 6) const uint TMP    = 8;     // PV: rows per subgroup
+layout(constant_id = 7) const uint SKIP   = 0;     // diagnosis: 1 skips S, 2 the softmax, 4 PV, 8 the K staging
+
+const uint SG   = 16;
+const uint NSG  = wgSize / SG;
+const uint R    = G * TQ;
+const uint DH4  = Dh / 4;
+const uint SRB  = R / TMS;                    // S row blocks
+const uint SKB  = NSG / SRB;                  // S key blocks
+const uint TNS  = BK / (SG * SKB);            // S keys per lane
+const uint RPS  = R / NSG;                    // softmax rows per subgroup
+const uint KPL  = BK / SG;                    // softmax keys per lane
+const uint PRB  = R / TMP;                    // PV row blocks
+const uint PDS  = NSG / PRB;                  // PV head-dim slices
+const uint SLICE = (DH4 + PDS - 1) / PDS;     // slots per slice
+const uint OVS  = (SLICE + SG - 1) / SG;      // slots per lane
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF { vec4 bufO[]; };
+layout(set = 0, binding = 1) readonly buffer Q_BUF { f16vec4 bufQ[]; };
+layout(set = 0, binding = 2) readonly buffer K_BUF { f16vec4 bufK[]; };
+layout(set = 0, binding = 3) readonly buffer V_BUF { f16vec4 bufV[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint Hq;
+    uint Hkv;
+    uint Tq;
+    uint Tk;
+    float scale;
+};
+
+shared f16vec4   sKt[DH4 * BK];   // [slot][key]
+shared f16vec4   sV[BK * DH4];    // [key][slot]
+shared float     sS[R * BK];      // scores, then P in place
+shared float     sAlpha[R];       // rescale factor of this block
+shared float     sSum[R];         // running sum (final)
+
+uint qRow(uint r, uint tok0, uint kvh, uint b) { return (b * Hq + kvh * G + r % G) * Tq + min(tok0 + r / G, Tq - 1); }
+
+void main()
+{
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint sg   = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tok0 = gl_WorkGroupID.x * TQ;
+    const uint kvh  = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+    const uint kvBase = (b * Hkv + kvh) * Tk;
+
+    // S tile of this subgroup
+    const uint sRow0 = (sg % SRB) * TMS, sKey0 = (sg / SRB) * SG * TNS;
+    // PV tile of this subgroup
+    const uint pRow0 = (sg % PRB) * TMP, pSlot0 = (sg / PRB) * SLICE;
+
+    float rowMax[RPS], rowSum[RPS];   // softmax state of this subgroup's rows (uniform)
+    [[unroll]] for (uint i = 0; i < RPS; i++) { rowMax[i] = -1e30; rowSum[i] = 0.0; }
+    vec4 acc[TMP][OVS];
+    [[unroll]] for (uint m = 0; m < TMP; m++)
+        [[unroll]] for (uint j = 0; j < OVS; j++) acc[m][j] = vec4(0.0);
+
+    for (uint k0 = 0; k0 < Tk; k0 += BK)
+    {
+        barrier();
+        if ((SKIP & 8u) == 0u) for (uint i = tid; i < BK * DH4; i += wgSize)
+        {
+            const uint kk = i / DH4, d4 = i % DH4, j = k0 + kk;
+            sKt[d4 * BK + kk] = (j < Tk) ? bufK[(kvBase + j) * DH4 + d4] : f16vec4(0.0hf);
+            sV[i]             = (j < Tk) ? bufV[(kvBase + j) * DH4 + d4] : f16vec4(0.0hf);
+        }
+        barrier();
+
+        // S = Q K^T
+        if ((SKIP & 1u) == 0u) {
+            float s[TMS][TNS];
+            [[unroll]] for (uint m = 0; m < TMS; m++)
+                [[unroll]] for (uint n = 0; n < TNS; n++) s[m][n] = 0.0;
+            uint qb[TMS];
+            [[unroll]] for (uint m = 0; m < TMS; m++) qb[m] = qRow(sRow0 + m, tok0, kvh, b) * DH4;
+            for (uint d4 = 0; d4 < DH4; d4++)
+            {
+                f16vec4 kv[TNS];
+                [[unroll]] for (uint n = 0; n < TNS; n++) kv[n] = sKt[d4 * BK + sKey0 + lane + SG * n];
+                [[unroll]] for (uint m = 0; m < TMS; m++)
+                {
+                    const f16vec4 q = bufQ[qb[m] + d4];
+                    [[unroll]] for (uint n = 0; n < TNS; n++) s[m][n] += float(dot(q, kv[n]));
+                }
+            }
+            [[unroll]] for (uint m = 0; m < TMS; m++)
+                [[unroll]] for (uint n = 0; n < TNS; n++)
+                {
+                    const uint key = sKey0 + lane + SG * n;
+                    sS[(sRow0 + m) * BK + key] = (k0 + key < Tk) ? s[m][n] * scale : -1e30;
+                }
+        }
+        barrier();
+
+        // softmax over this block, P in place
+        if ((SKIP & 2u) == 0u) [[unroll]] for (uint i = 0; i < RPS; i++)
+        {
+            const uint r = sg * RPS + i;
+            float v[KPL], mx = -1e30;
+            [[unroll]] for (uint n = 0; n < KPL; n++) { v[n] = sS[r * BK + lane + SG * n]; mx = max(mx, v[n]); }
+            const float newMax = max(rowMax[i], subgroupMax(mx));
+            const float alpha = exp(rowMax[i] - newMax);
+            float sum = 0.0;
+            [[unroll]] for (uint n = 0; n < KPL; n++) { const float p = exp(v[n] - newMax); sS[r * BK + lane + SG * n] = p; sum += p; }
+            rowSum[i] = rowSum[i] * alpha + subgroupAdd(sum);
+            rowMax[i] = newMax;
+            if (lane == 0) sAlpha[r] = alpha;
+        }
+        barrier();
+
+        // O += P V
+        if ((SKIP & 4u) == 0u) {
+            [[unroll]] for (uint m = 0; m < TMP; m++)
+            {
+                const float alpha = sAlpha[pRow0 + m];
+                [[unroll]] for (uint j = 0; j < OVS; j++) acc[m][j] *= alpha;
+            }
+            [[unroll]] for (uint kk = 0; kk < BK; kk++)   // keys past Tk carry P 0 and V 0
+            {
+                vec4 v[OVS];
+                [[unroll]] for (uint j = 0; j < OVS; j++)
+                {
+                    const uint slot = pSlot0 + lane + SG * j;
+                    v[j] = (lane + SG * j < SLICE && slot < DH4) ? vec4(sV[kk * DH4 + slot]) : vec4(0.0);
+                }
+                [[unroll]] for (uint m = 0; m < TMP; m++)
+                {
+                    const float p = sS[(pRow0 + m) * BK + kk];
+                    [[unroll]] for (uint j = 0; j < OVS; j++) acc[m][j] += p * v[j];
+                }
+            }
+        }
+    }
+
+    // final sums to the PV owners
+    barrier();
+    [[unroll]] for (uint i = 0; i < RPS; i++) if (lane == 0) sSum[sg * RPS + i] = rowSum[i];
+    barrier();
+    [[unroll]] for (uint m = 0; m < TMP; m++)
+    {
+        const uint r = pRow0 + m, t = tok0 + r / G, h = kvh * G + r % G;
+        if (t >= Tq) continue;
+        const float inv = 1.0 / sSum[r];
+        [[unroll]] for (uint j = 0; j < OVS; j++)
+        {
+            const uint slot = pSlot0 + lane + SG * j;
+            if (lane + SG * j < SLICE && slot < DH4) bufO[((b * Tq + t) * Hq + h) * DH4 + slot] = acc[m][j] * inv;
+        }
+    }
+}

@@ -1,0 +1,169 @@
+/*=============================================================================
+ attention-fa-intel.comp: flash attention for Intel GPUs without matrix
+     engines (Xe-LPG), at subgroup 16, as two register-tiled products per KV
+     block (tests/attention-tune-intel, version 1)
+
+     O[b, t, h, :] = sum_j softmax_j(Q[b, h, t, :] · K[b, h / G, j, :] * scale) V[b, h / G, j, :]
+
+     Q [B, Hq, Tq, Dh] fp16, K / V [B, Hkv, Tk, Dh] fp16, O [B, Tq, Hq, Dh] fp32
+     (token-major, as Linear reads it back). No mask: every query sees every key.
+
+ One workgroup owns R = TQ tokens x G query heads of one KV head (rows r:
+ token r / G, head kvHead * G + r % G), so the G heads that share a KV head
+ read each K / V block once. Per KV block of BK keys:
+   - K and V stage into shared memory, K transposed ([Dh/4][BK] of 4-dim
+     slots) so a subgroup's lanes read neighbouring keys
+   - S = Q K^T: subgroup s owns rows s*TM .. s*TM + TM - 1; lane l owns keys
+     l + 16n (n < TN); Q slots are read at uniform addresses
+   - online softmax per row with subgroup max / add; P goes to shared memory
+   - O += P V: the same subgroup, the same rows; lane l owns head-dim slots
+     l + 16j; P is read at uniform addresses
+ Requirements: wgSize = NSG * 16 forced; R % NSG == 0; BK % 16 == 0; Dh % 4 == 0.
+ Dispatch: (ceil(Tq / TQ), Hkv, B).
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 128;   // threads per workgroup, a multiple of 16
+layout(constant_id = 1) const uint Dh     = 256;   // head dim
+layout(constant_id = 2) const uint G      = 8;     // query heads per KV head handled together
+layout(constant_id = 3) const uint TQ     = 2;     // query tokens per workgroup
+layout(constant_id = 4) const uint BK     = 32;    // keys per block
+
+const uint SG  = 16;
+const uint NSG = wgSize / SG;            // subgroups
+const uint R   = G * TQ;                 // rows per workgroup
+const uint TM  = R / NSG;                // rows per subgroup
+const uint TN  = BK / SG;                // keys per lane
+const uint DH4 = Dh / 4;                 // head dim in 4-dim slots
+const uint OV4 = (DH4 + SG - 1) / SG;    // O slots per lane and row
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF { vec4 bufO[]; };
+layout(set = 0, binding = 1) readonly buffer Q_BUF { f16vec4 bufQ[]; };
+layout(set = 0, binding = 2) readonly buffer K_BUF { f16vec4 bufK[]; };
+layout(set = 0, binding = 3) readonly buffer V_BUF { f16vec4 bufV[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint Hq;
+    uint Hkv;
+    uint Tq;
+    uint Tk;
+    float scale;
+};
+
+shared f16vec4   sQ[R * DH4];    // [row][slot], pre-scaled
+shared f16vec4   sKt[DH4 * BK];  // [slot][key]
+shared f16vec4   sV[BK * DH4];   // [key][slot]
+shared float16_t sP[R * BK];     // [row][key]
+
+void main()
+{
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint sg   = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tok0 = gl_WorkGroupID.x * TQ;
+    const uint kvh  = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+
+    for (uint i = tid; i < R * DH4; i += wgSize)
+    {
+        const uint r = i / DH4, d4 = i % DH4, t = tok0 + r / G, h = kvh * G + r % G;
+        sQ[i] = (t < Tq) ? f16vec4(vec4(bufQ[((b * Hq + h) * Tq + t) * DH4 + d4]) * scale) : f16vec4(0.0hf);
+    }
+
+    float rowMax[TM], rowSum[TM];
+    vec4 acc[TM][OV4];
+    [[unroll]] for (uint m = 0; m < TM; m++)
+    {
+        rowMax[m] = -1e30; rowSum[m] = 0.0;
+        [[unroll]] for (uint j = 0; j < OV4; j++) acc[m][j] = vec4(0.0);
+    }
+
+    const uint kvBase = (b * Hkv + kvh) * Tk;
+    for (uint k0 = 0; k0 < Tk; k0 += BK)
+    {
+        barrier();   // the previous block's readers are done
+        for (uint i = tid; i < BK * DH4; i += wgSize)
+        {
+            const uint kk = i / DH4, d4 = i % DH4, j = k0 + kk;
+            const bool live = j < Tk;
+            sKt[d4 * BK + kk] = live ? bufK[(kvBase + j) * DH4 + d4] : f16vec4(0.0hf);
+            sV[i]             = live ? bufV[(kvBase + j) * DH4 + d4] : f16vec4(0.0hf);
+        }
+        barrier();
+
+        // S = Q K^T for this subgroup's rows and this lane's keys.
+        float s[TM][TN];
+        [[unroll]] for (uint m = 0; m < TM; m++)
+            [[unroll]] for (uint n = 0; n < TN; n++) s[m][n] = 0.0;
+        for (uint d4 = 0; d4 < DH4; d4++)
+        {
+            f16vec4 kv[TN];
+            [[unroll]] for (uint n = 0; n < TN; n++) kv[n] = sKt[d4 * BK + lane + SG * n];
+            [[unroll]] for (uint m = 0; m < TM; m++)
+            {
+                const f16vec4 q = sQ[(sg * TM + m) * DH4 + d4];
+                [[unroll]] for (uint n = 0; n < TN; n++) s[m][n] += float(dot(q, kv[n]));
+            }
+        }
+
+        // Online softmax: P to shared memory, the accumulator rescaled.
+        [[unroll]] for (uint m = 0; m < TM; m++)
+        {
+            float mx = -1e30;
+            [[unroll]] for (uint n = 0; n < TN; n++)
+            {
+                if (k0 + lane + SG * n >= Tk) s[m][n] = -1e30;
+                mx = max(mx, s[m][n]);
+            }
+            const float newMax = max(rowMax[m], subgroupMax(mx));
+            const float alpha = exp(rowMax[m] - newMax);
+            float sum = 0.0;
+            [[unroll]] for (uint n = 0; n < TN; n++)
+            {
+                const float p = exp(s[m][n] - newMax);
+                sP[(sg * TM + m) * BK + lane + SG * n] = float16_t(p);
+                sum += p;
+            }
+            rowSum[m] = rowSum[m] * alpha + subgroupAdd(sum);
+            rowMax[m] = newMax;
+            [[unroll]] for (uint j = 0; j < OV4; j++) acc[m][j] *= alpha;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // O += P V
+        for (uint kk = 0; kk < BK; kk++)
+        {
+            vec4 v[OV4];
+            [[unroll]] for (uint j = 0; j < OV4; j++)
+            {
+                const uint d4 = lane + SG * j;
+                v[j] = (d4 < DH4) ? vec4(sV[kk * DH4 + d4]) : vec4(0.0);
+            }
+            [[unroll]] for (uint m = 0; m < TM; m++)
+            {
+                const float p = float(sP[(sg * TM + m) * BK + kk]);
+                [[unroll]] for (uint j = 0; j < OV4; j++) acc[m][j] += p * v[j];
+            }
+        }
+    }
+
+    [[unroll]] for (uint m = 0; m < TM; m++)
+    {
+        const uint r = sg * TM + m, t = tok0 + r / G, h = kvh * G + r % G;
+        if (t >= Tq) continue;
+        const float inv = 1.0 / rowSum[m];
+        [[unroll]] for (uint j = 0; j < OV4; j++)
+        {
+            const uint d4 = lane + SG * j;
+            if (d4 < DH4) bufO[((b * Tq + t) * Hq + h) * DH4 + d4] = acc[m][j] * inv;
+        }
+    }
+}

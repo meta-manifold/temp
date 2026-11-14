@@ -1,0 +1,319 @@
+/*=============================================================================
+ linear-tile-21.comp: a port of OpenVINO's fully_connected_gpu_bf_tiled
+     (fp16, static shape, uncompressed weights) with split-K and the switches
+     below: one subgroup per workgroup, no shared memory, no barrier
+
+     O[m, n] = sum_k I[m, k] * W[n, k]
+
+ W comes reordered in osv = tileOfm * 16 column blocks, as OpenVINO's
+ os_iyx_osv16 / osv32, with each lane's tileK x tileOfm weights of a k group
+ next to each other: W'[n / osv, k / tileK, n % 16, (k % tileK) * tileOfm +
+ (n % osv) / 16], N padded up to osv and K up to tileK with zeros. A k group
+ is then one contiguous run of 16 x tileK x tileOfm values, which the
+ subgroup reads with one vector load per lane: OpenVINO's filter block read
+ of the same run.
+
+ A subgroup owns tileB rows x (tileOfm * 16) columns; lane j holds columns
+ outF + fi * 16 + j. Rows past M read row M - 1 and are not stored. Per 16 k
+ (OpenVINO's main loop at TILE_IFM 1):
+   - each row's 16 k values load one per lane (OpenVINO's input block read)
+   - tileK k at a time, the lane reads its tileK x tileOfm weights (the
+     filter block read), and each row's k value reaches every lane by a
+     subgroup broadcast (OpenVINO's _sub_group_shuffle at a constant lane)
+   - the 16 k sum into a fresh accumulator, then adds onto the running one
+     (OpenVINO's acc_tmp / acc)
+ K % 16 leftovers add straight onto the running accumulator, as OpenVINO's.
+
+ Dispatch order is OpenVINO's bs_fs_bsv_fsv: a group of dispatchBsv row
+ tiles x dispatchFsv column tiles runs column-fastest, and the groups run
+ column-fastest (megaMFirst 0) or row-fastest (1). Neither size needs to
+ divide the tile counts; tiles past M or N return. The flat tile index is
+ gid = x * numY + y (Intel walks a 2D grid y-fastest), so the host can fold a
+ grid wider than the x limit: (ceil(fTiles / fsv) * ceil(bTiles / bsv) * fsv
+ * bsv) workgroups.
+
+ Split-K: workgroup z owns the K span [z * splitSize, min(K, (z + 1) *
+ splitSize)), splitSize a multiple of 16, and writes its partials to P[z, M, N]
+ on binding 0; the host folds them.
+
+ OpenVINO's EXE_MODE_AGE_BASED (an OpenCL build option for thread
+ arbitration) has no Vulkan counterpart and is left out.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 4)  const uint tileK       = 2;   // k per weight read (TILE_K)
+layout(constant_id = 7)  const uint tileB       = 8;   // rows per subgroup (TILE_B)
+layout(constant_id = 8)  const uint tileOfm     = 2;   // 16-column groups per subgroup (TILE_OFM)
+layout(constant_id = 9)  const uint dispatchFsv = 1;   // column tiles run next to each other (DISPATCH_FSV)
+layout(constant_id = 10) const uint dispatchBsv = 1;   // row tiles run next to each other (DISPATCH_BSV)
+layout(constant_id = 11) const uint accType     = 1;   // accumulator dtype (0: fp32, 1: fp16)
+layout(constant_id = 14) const uint megaMFirst  = 0;   // 1: the bsv x fsv groups run row-fastest
+layout(constant_id = 13) const uint variant     = 0;   // bit 0: one-level accumulation; bit 1: I loaded a trip ahead;
+                                                       // bit 2: W as given ([N, K] rows), not reordered;
+                                                       // bit 3: W in 16-column blocks whatever tileOfm (tileK 2)
+layout(constant_id = SPEC_ID_ALIGNED) const uint aligned = 1;   // bit 2: K % tileK == 0, tileK-wide W row loads
+
+const bool oneLevel  = (variant & 1u) != 0u;
+const bool prefetchI = (variant & 2u) != 0u;
+const bool rowW      = (variant & 4u) != 0u;
+const bool canon16   = (variant & 8u) != 0u;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 1;  // W (weight) dtype
+
+const uint SIMD = 16u;
+const uint OSV  = tileOfm * SIMD;   // columns per subgroup = the weight layout's block
+const uint TKO  = tileK * tileOfm;  // weights per lane per k group
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer W_BUF_F32 { float bufferW_f32[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_2F16 { uint  bufferW_2f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_4F16 { uvec2 bufferW_4f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_8F16 { uvec4 bufferW_8f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint splitSize;   // K span per workgroup z (= K without splitting), a multiple of 16
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+float readW(uint i) { return (typeW == DTYPE_F32) ? bufferW_f32[i] : float(bufferW_f16[i]); }
+float16_t readIh(uint i) { return (typeI == DTYPE_F32) ? float16_t(bufferI_f32[i]) : bufferI_f16[i]; }
+float16_t readWh(uint i) { return (typeW == DTYPE_F32) ? float16_t(bufferW_f32[i]) : bufferW_f16[i]; }
+// A lane's TKO weights of k group slot v (= (block * kGroups + group) * 16 + lane):
+// one vector load for fp16 W.
+void readW16(uint v, out float16_t w[TKO])
+{
+    if (typeW == DTYPE_F16 && TKO == 2u)
+    { const f16vec2 a = unpackFloat2x16(bufferW_2f16[v]); w[0] = a.x; w[1 % TKO] = a.y; }
+    else if (typeW == DTYPE_F16 && TKO == 4u)
+    {
+        const uvec2 u = bufferW_4f16[v];
+        const f16vec2 a = unpackFloat2x16(u.x), b = unpackFloat2x16(u.y);
+        w[0] = a.x; w[1 % TKO] = a.y; w[2 % TKO] = b.x; w[3 % TKO] = b.y;
+    }
+    else if (typeW == DTYPE_F16 && TKO == 8u)
+    {
+        const uvec4 u = bufferW_8f16[v];
+        [[unroll]] for (uint q = 0; q < 4u; q++)
+        { const f16vec2 a = unpackFloat2x16(u[q]); w[(2u * q) % TKO] = a.x; w[(2u * q + 1u) % TKO] = a.y; }
+    }
+    else
+        [[unroll]] for (uint j = 0; j < TKO; j++) w[j] = readWh(v * TKO + j);
+}
+
+// rowW: tileK weights of column n from k (W[n, k .. k + tileK)), one vector load when aligned.
+void readRowW16(uint n, uint k, out float16_t w[tileK])
+{
+    const uint i = n * K + k;
+    if (typeW == DTYPE_F16 && aligned != 0u && tileK == 2u)
+    { const f16vec2 a = unpackFloat2x16(bufferW_2f16[i / 2u]); w[0] = a.x; w[1 % tileK] = a.y; }
+    else if (typeW == DTYPE_F16 && aligned != 0u && tileK == 4u)
+    {
+        const uvec2 u = bufferW_4f16[i / 4u];
+        const f16vec2 a = unpackFloat2x16(u.x), b = unpackFloat2x16(u.y);
+        w[0] = a.x; w[1 % tileK] = a.y; w[2 % tileK] = b.x; w[3 % tileK] = b.y;
+    }
+    else if (typeW == DTYPE_F16 && aligned != 0u && tileK == 8u)
+    {
+        const uvec4 u = bufferW_8f16[i / 8u];
+        [[unroll]] for (uint q = 0; q < 4u; q++)
+        { const f16vec2 a = unpackFloat2x16(u[q]); w[(2u * q) % tileK] = a.x; w[(2u * q + 1u) % tileK] = a.y; }
+    }
+    else
+        [[unroll]] for (uint j = 0; j < tileK; j++) w[j] = readWh(i + j);
+}
+
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+void main()
+{
+    const uint lane   = gl_SubgroupInvocationID;
+    const uint fTiles = (N + OSV - 1u) / OSV;
+    const uint bTiles = (M + tileB - 1u) / tileB;
+    const uint fGroups = (fTiles + dispatchFsv - 1u) / dispatchFsv;
+    const uint bGroups = (bTiles + dispatchBsv - 1u) / dispatchBsv;
+    const uint gid    = gl_WorkGroupID.x * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    if (gid >= fGroups * bGroups * dispatchFsv * dispatchBsv) return;
+
+    const uint inner = gid % (dispatchFsv * dispatchBsv), group = gid / (dispatchFsv * dispatchBsv);
+    const uint fMini = inner % dispatchFsv;
+    const uint bMini = inner / dispatchFsv;
+    const uint fMega = (megaMFirst != 0u) ? group / bGroups : group % fGroups;
+    const uint bMega = (megaMFirst != 0u) ? group % bGroups : group / fGroups;
+    const uint outF  = (fMega * dispatchFsv + fMini) * OSV;
+    const uint outB  = (bMega * dispatchBsv + bMini) * tileB;
+    if (outB >= M || outF >= N) return;
+
+    // Both accumulator dtypes are declared; accType picks one, the other
+    // vanishes at ISA compilation.
+    float16_t acc16[tileB * tileOfm], tmp16[tileB * tileOfm];
+    float     acc32[tileB * tileOfm], tmp32[tileB * tileOfm];
+    [[unroll]] for (uint i = 0; i < tileB * tileOfm; i++) { acc16[i] = 0.0hf; acc32[i] = 0.0; }
+
+    const uint kGroups = (K + tileK - 1u) / tileK;
+    const uint startK  = gl_WorkGroupID.z * splitSize;
+    const uint spanK   = min(K, startK + splitSize) - startK;
+    uint wSlot = ((outF / OSV) * kGroups + startK / tileK) * SIMD + lane;   // this lane's slot of my first k group
+
+    const uint trips = spanK / SIMD;
+    float16_t nx16[tileB];   // prefetchI: the next trip's I
+    float     nx32[tileB];
+    if (prefetchI && trips > 0u)
+        [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+        {
+            const uint row = min(outB + bi, M - 1u);
+            if (accType == 0u) nx32[bi] = readI(row * K + startK + lane);
+            else               nx16[bi] = readIh(row * K + startK + lane);
+        }
+    [[dont_unroll]]
+    for (uint ni = 0; ni < trips; ni++)
+    {
+        const uint k0 = startK + ni * SIMD;
+        float16_t in16[tileB];
+        float     in32[tileB];
+        [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+        {
+            const uint row = min(outB + bi, M - 1u);
+            if (prefetchI)
+            {
+                in16[bi] = nx16[bi]; in32[bi] = nx32[bi];
+                const uint kn = min(k0 + SIMD, startK + (trips - 1u) * SIMD);   // the last trip reloads itself
+                if (accType == 0u) nx32[bi] = readI(row * K + kn + lane);
+                else               nx16[bi] = readIh(row * K + kn + lane);
+            }
+            else if (accType == 0u) in32[bi] = readI(row * K + k0 + lane);
+            else                    in16[bi] = readIh(row * K + k0 + lane);
+        }
+        [[unroll]] for (uint i = 0; i < tileB * tileOfm; i++)
+        { tmp16[i] = oneLevel ? acc16[i] : 0.0hf; tmp32[i] = oneLevel ? acc32[i] : 0.0; }
+
+        [[unroll]] for (uint ki = 0; ki < SIMD / tileK; ki++)
+        {
+            float16_t w16[TKO];
+            float     w32[TKO];
+            if (rowW)
+            {
+                [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+                {
+                    const uint n = min(outF + fi * SIMD + lane, N - 1u);
+                    const uint k = k0 + ki * tileK;
+                    if (accType == 0u && typeW == DTYPE_F32)
+                        [[unroll]] for (uint j = 0; j < tileK; j++) w32[j * tileOfm + fi] = readW(n * K + k + j);
+                    else
+                    {
+                        float16_t r[tileK];
+                        readRowW16(n, k, r);
+                        [[unroll]] for (uint j = 0; j < tileK; j++)
+                        { w16[j * tileOfm + fi] = r[j]; w32[j * tileOfm + fi] = float(r[j]); }
+                    }
+                }
+            }
+            else if (canon16)   // W'[n / 16, k / 2, n % 16, k % 2]: a uint per 16-column block
+            {
+                const uint kg = startK / 2u + (k0 - startK) / 2u + ki;
+                [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+                {
+                    const f16vec2 a = unpackFloat2x16(bufferW_2f16[((outF / SIMD + fi) * kGroups + kg) * SIMD + lane]);
+                    w16[fi] = a.x; w16[tileOfm + fi] = a.y;
+                    w32[fi] = float(a.x); w32[tileOfm + fi] = float(a.y);
+                }
+            }
+            else if (accType == 0u && typeW == DTYPE_F32) [[unroll]] for (uint j = 0; j < TKO; j++) w32[j] = readW(wSlot * TKO + j);
+            else
+            {
+                readW16(wSlot, w16);   // fp32 accumulation widens the fp16 read, as OpenVINO's TO_FILTER_VEC_TYPE
+                if (accType == 0u) [[unroll]] for (uint j = 0; j < TKO; j++) w32[j] = float(w16[j]);
+            }
+            wSlot += SIMD;
+
+            [[unroll]] for (uint kii = 0; kii < tileK; kii++)
+            {
+                const uint kk = ki * tileK + kii;
+                [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+                {
+                    if (accType == 0u)
+                    {
+                        const float x = subgroupBroadcast(in32[bi], kk);
+                        [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+                            tmp32[bi * tileOfm + fi] = fma(x, w32[kii * tileOfm + fi], tmp32[bi * tileOfm + fi]);
+                    }
+                    else
+                    {
+                        const float16_t x = subgroupBroadcast(in16[bi], kk);
+                        [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+                            tmp16[bi * tileOfm + fi] = fma(x, w16[kii * tileOfm + fi], tmp16[bi * tileOfm + fi]);
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint i = 0; i < tileB * tileOfm; i++)
+        {
+            acc16[i] = oneLevel ? tmp16[i] : acc16[i] + tmp16[i];
+            acc32[i] = oneLevel ? tmp32[i] : acc32[i] + tmp32[i];
+        }
+    }
+
+    const uint left = spanK % SIMD;
+    if (left != 0u)
+    {
+        const uint k0 = startK + trips * SIMD;
+        float16_t in16[tileB];
+        float     in32[tileB];
+        [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+        {
+            const uint row = min(outB + bi, M - 1u);
+            if (accType == 0u) in32[bi] = (lane < left) ? readI(row * K + k0 + lane) : 0.0;
+            else               in16[bi] = (lane < left) ? readIh(row * K + k0 + lane) : 0.0hf;
+        }
+        for (uint kk = 0; kk < left; kk++)
+        {
+            [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+            {
+                const uint k  = k0 + kk;
+                const uint wi = rowW ? min(outF + fi * SIMD + lane, N - 1u) * K + k
+                              : canon16 ? ((outF / SIMD + fi) * kGroups + k / 2u) * 32u + lane * 2u + k % 2u
+                                     : (((outF / OSV) * kGroups + k / tileK) * SIMD + lane) * TKO + (k % tileK) * tileOfm + fi;
+                [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+                {
+                    if (accType == 0u)
+                        acc32[bi * tileOfm + fi] = fma(subgroupShuffle(in32[bi], kk), readW(wi), acc32[bi * tileOfm + fi]);
+                    else
+                        acc16[bi * tileOfm + fi] = fma(subgroupShuffle(in16[bi], kk), readWh(wi), acc16[bi * tileOfm + fi]);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint bi = 0; bi < tileB; bi++)
+    {
+        const uint row = outB + bi;
+        [[unroll]] for (uint fi = 0; fi < tileOfm; fi++)
+        {
+            const uint n = outF + fi * SIMD + lane;
+            if (row < M && n < N)
+                writeO(gl_WorkGroupID.z * M * N + row * N + n, (accType == 0u) ? acc32[bi * tileOfm + fi] : float(acc16[bi * tileOfm + fi]));
+        }
+    }
+}

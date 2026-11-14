@@ -1,0 +1,73 @@
+/*=============================================================================
+ slabp.comp: linear-slab's decomposition (vai/shaders/linear-slab.comp) over
+     the packed W: a workgroup owns one lane slot of a 32-column block, the
+     columns n and n + 16, and its threads split K, each reading the slot's
+     8 B (two k x the two columns) of k pairs t, t + WG, ...; subgroupAdd and
+     shared memory fold the partials. M = 1, fp32 accumulation.
+
+ Dispatch (host): (ceil(N / 32) * 16, 1, 1).
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = WG (same SpecId)
+
+layout(constant_id = 0) const uint WG = 64;   // threads per workgroup, a multiple of 16
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_2F32 { vec2 bufferI_2f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_2F16 { uint bufferI_2f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_4F16 { uvec2 bufferW_4f16[]; };
+
+layout(push_constant) uniform PushConstants { uint M; uint N; uint K; uint splitSize; };
+
+vec2 readI2(uint p) { return (typeI == DTYPE_F32) ? bufferI_2f32[p] : vec2(unpackFloat2x16(bufferI_2f16[p])); }   // K even
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+shared vec2 sSum[WG / 16u];
+
+vec2 slotDot(uint v, vec2 x)
+{
+    const uvec2 u = bufferW_4f16[v];
+    const vec2 a = vec2(unpackFloat2x16(u.x)), b = vec2(unpackFloat2x16(u.y));   // [k0 n0, k0 n1], [k1 n0, k1 n1]
+    return vec2(a.x * x.x + b.x * x.y, a.y * x.x + b.y * x.y);
+}
+
+void main()
+{
+    const uint t = gl_LocalInvocationID.x, slot = gl_WorkGroupID.x;
+    const uint blk = slot / 16u, l = slot % 16u;
+    const uint kPairs = K / 2u;
+    const uint base = blk * kPairs * 16u + l;   // slot index of k pair 0
+
+    vec2 acc = vec2(0.0);
+    uint p = t;
+    for (; p + 3u * WG < kPairs; p += 4u * WG)
+        [[unroll]] for (uint u = 0; u < 4u; u++)
+            acc += slotDot(base + (p + u * WG) * 16u, readI2(p + u * WG));
+    for (; p < kPairs; p += WG)
+        acc += slotDot(base + p * 16u, readI2(p));
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) sSum[gl_SubgroupID] = acc;
+    barrier();
+    if (t == 0u)
+    {
+        vec2 s = vec2(0.0);
+        [[unroll]] for (uint g = 0; g < WG / 16u; g++) s += sSum[g];
+        const uint n0 = blk * 32u + l;
+        if (n0 < N) writeO(n0, s.x);
+        if (n0 + 16u < N) writeO(n0 + 16u, s.y);
+    }
+}

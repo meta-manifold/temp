@@ -1,0 +1,231 @@
+/*=============================================================================
+ attention-fa-intel9.comp: version 9: version 8 with the keys split over
+     SPLIT workgroups per tile; the last one to finish merges the partial
+     results (tests/attention-tune-intel)
+
+     Q [B, Hq, Tq, Dh] fp16, K / V [B, Hkv, Tk, Dh] fp16, O [B, Tq, Hq, Dh] fp32.
+
+ One workgroup owns R = TQ tokens x G query heads of one KV head; Q stays in
+ shared memory pre-scaled. The subgroups split as RG = R / 16 row groups x
+ KB key groups, so a block is BK = 16 * KB keys. Per block:
+   - S = Q K^T: lane l of a subgroup owns row 16 * rg + l and 16 keys. Each
+     key row loads once (lane = head-dim pair) and every lane takes it dim by
+     dim through subgroupBroadcast.
+   - softmax: a lane owns its row, so the max and sum need no subgroup
+     reduction; the key groups exchange their maxima through shared memory
+     and keep their own partial sums. P (fp16) goes to shared memory.
+   - O += P V: the subgroups split R x Dh as PRB row blocks x DS = ceil(Dh / 64) slices;
+     lane l owns head dims 4l .. 4l + 3 of its slice and TMP = R / PRB rows.
+     P loads 16 keys at a time (lane = key) and is broadcast key by key; V
+     loads straight from global memory (lane = 4 head dims).
+ Requirements: wgSize = NSG * 16 forced; R % 16 == 0; BK = 16 * NSG / RG;
+ Dh % 4 == 0; NSG % DS == 0 and R % (NSG / DS) == 0.
+ Split: workgroup x = tile * SPLIT + split takes keys [split * chunk, +chunk)
+ (chunk a multiple of BK), writes its unnormalized O and per-row (max, sum)
+ to bufPart and counts itself in bufCnt[tile]; the SPLIT-th to arrive merges
+ them into O and resets the count.
+ Dispatch: (ceil(Tq / TQ) * SPLIT, Hkv, B).
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 512;   // threads per workgroup, a multiple of 16
+layout(constant_id = 1) const uint Dh     = 256;   // head dim
+layout(constant_id = 2) const uint G      = 8;     // query heads per KV head handled together
+layout(constant_id = 3) const uint TQ     = 4;     // query tokens per workgroup
+layout(constant_id = 4) const uint BK     = 256;   // keys per block (= 16 * NSG / RG)
+layout(constant_id = 5) const uint SPLIT  = 1;     // workgroups a tile's keys split over
+layout(constant_id = 7) const uint SKIP   = 0;     // diagnosis: 1 skips S, 2 the softmax, 4 PV
+
+const uint SG   = 16;
+const uint NSG  = wgSize / SG;
+const uint R    = G * TQ;
+const uint RG   = R / SG;                     // S row groups
+const uint KB   = NSG / RG;                   // S key groups
+const uint DH2  = Dh / 2;
+const uint DH4  = Dh / 4;
+const uint DS   = (DH4 + SG - 1) / SG;        // PV head-dim slices of 16 slots
+const uint PRB  = NSG / DS;                   // PV row blocks
+const uint TMP  = R / PRB;                    // PV rows per subgroup
+const uint PST  = BK + 4;                     // sP row stride, padded off the bank of the next row
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF { vec4 bufO[]; };
+layout(set = 0, binding = 1) readonly buffer Q_BUF { f16vec2 bufQ[]; };
+layout(set = 0, binding = 2) readonly buffer K_BUF { f16vec2 bufK[]; };
+layout(set = 0, binding = 3) readonly buffer V_BUF { f16vec4 bufV[]; };
+layout(set = 0, binding = 4) coherent buffer PART_BUF { vec4 bufPart[]; };   // partial O, then (max, sum) per row
+layout(set = 0, binding = 5) coherent buffer CNT_BUF { uint bufCnt[]; };      // splits done per tile
+
+layout(push_constant) uniform PushConstants {
+    uint Hq;
+    uint Hkv;
+    uint Tq;
+    uint Tk;
+    float scale;
+};
+
+shared f16vec2   sQ[DH2 * R];     // [dim pair][row]
+shared float16_t sP[R * PST];     // [row][key]
+shared float     sMax[KB * R];    // block maxima of each key group, then the final partial sums
+shared float     sAlpha[R];       // rescale factor of this block, then the row maxima
+shared bool      sLast;
+
+void main()
+{
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint sg   = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tile = gl_WorkGroupID.x / SPLIT, split = gl_WorkGroupID.x % SPLIT;
+    const uint tok0 = tile * TQ;
+    const uint kvh  = gl_WorkGroupID.y;
+    const uint b    = gl_WorkGroupID.z;
+    const uint kvBase = (b * Hkv + kvh) * Tk;
+    const uint chunk = ((Tk + SPLIT - 1) / SPLIT + BK - 1) / BK * BK;
+    const uint kBeg = split * chunk, kStop = min(Tk, kBeg + chunk);
+
+    for (uint i = tid; i < R * DH2; i += wgSize)
+    {
+        const uint r = i / DH2, dp = i % DH2, t = tok0 + r / G, h = kvh * G + r % G;
+        sQ[dp * R + r] = (t < Tq) ? f16vec2(vec2(bufQ[((b * Hq + h) * Tq + t) * DH2 + dp]) * (scale * 1.44269504)) : f16vec2(0.0hf);
+    }
+    barrier();
+
+    // S / softmax role: row sRow, keys sKey0 .. sKey0 + 15 of each block
+    const uint rg = sg % RG, kb = sg / RG;
+    const uint sRow = rg * SG + lane, sKey0 = kb * SG;
+    float rowMax = -1e30, rowSum = 0.0;   // rowSum: this key group's share
+    // PV role: rows pRow0 .., head dims 64 * ds + 4 * lane ..
+    const uint pRow0 = (sg % PRB) * TMP, pSlot = (sg / PRB) * 16 + lane;
+    vec4 acc[TMP];
+    [[unroll]] for (uint m = 0; m < TMP; m++) acc[m] = vec4(0.0);
+
+    for (uint k0 = kBeg; k0 < kStop; k0 += BK)
+    {
+        // S = Q K^T
+        float16_t s[SG];
+        [[unroll]] for (uint j = 0; j < SG; j++) s[j] = 0.0hf;
+        if ((SKIP & 1u) == 0u)
+        {
+            [[dont_unroll]] for (uint dp = 0; dp < DH2; dp += SG)
+            {
+                f16vec2 q[SG];
+                [[unroll]] for (uint i = 0; i < SG; i++) q[i] = sQ[min(dp + i, DH2 - 1) * R + sRow];
+                [[unroll]] for (uint j = 0; j < SG; j++)
+                {
+                    const f16vec2 k = (dp + lane < DH2) ? bufK[(kvBase + min(k0 + sKey0 + j, Tk - 1)) * DH2 + dp + lane] : f16vec2(0.0hf);
+                    [[unroll]] for (uint i = 0; i < SG; i++)
+                    {
+                        const f16vec2 kb2 = subgroupBroadcast(k, i);
+                        s[j] = fma(kb2.x, q[i].x, fma(kb2.y, q[i].y, s[j]));
+                    }
+                }
+            }
+        }
+
+        // softmax: the block max across key groups, P, this group's sum
+        float mx = -1e30;
+        [[unroll]] for (uint j = 0; j < SG; j++) if (k0 + sKey0 + j < kStop) mx = max(mx, float(s[j]));
+        sMax[kb * R + sRow] = mx;
+        barrier();
+        if ((SKIP & 2u) == 0u)
+        {
+            [[unroll]] for (uint g = 0; g < KB; g++) mx = max(mx, sMax[g * R + sRow]);
+            const float newMax = max(rowMax, mx), alpha = exp2(rowMax - newMax);
+            float sum = 0.0;
+            [[unroll]] for (uint j = 0; j < SG; j += 4)
+            {
+                f16vec4 p4;
+                [[unroll]] for (uint c = 0; c < 4; c++)
+                {
+                    const float p = (k0 + sKey0 + j + c < kStop) ? exp2(float(s[j + c]) - newMax) : 0.0;
+                    p4[c] = float16_t(p); sum += p;
+                }
+                sP[sRow * PST + sKey0 + j] = p4.x; sP[sRow * PST + sKey0 + j + 1] = p4.y;
+                sP[sRow * PST + sKey0 + j + 2] = p4.z; sP[sRow * PST + sKey0 + j + 3] = p4.w;
+            }
+            rowSum = rowSum * alpha + sum;
+            rowMax = newMax;
+            if (kb == 0) sAlpha[sRow] = alpha;
+        }
+        barrier();
+
+        // O += P V
+        if ((SKIP & 4u) == 0u)
+        {
+            [[unroll]] for (uint m = 0; m < TMP; m++) acc[m] *= sAlpha[pRow0 + m];
+            const uint kEnd = min(BK, kStop - k0);
+            [[dont_unroll]] for (uint kc = 0; kc < kEnd; kc += SG)
+            {
+                float16_t p[TMP];
+                [[unroll]] for (uint m = 0; m < TMP; m++) p[m] = sP[(pRow0 + m) * PST + kc + lane];
+                [[unroll]] for (uint i = 0; i < SG; i++)
+                {
+                    const vec4 v = vec4(bufV[(kvBase + min(k0 + kc + i, Tk - 1)) * DH4 + min(pSlot, DH4 - 1)]);
+                    [[unroll]] for (uint m = 0; m < TMP; m++) acc[m] += float(subgroupBroadcast(p[m], i)) * v;
+                }
+            }
+        }
+    }
+
+    // the key groups' partial sums and the row maxima to the PV owners, then this split's part out
+    barrier();
+    sMax[kb * R + sRow] = rowSum;
+    if (kb == 0) sAlpha[sRow] = rowMax;
+    barrier();
+    if (SPLIT == 1)
+    {
+        [[unroll]] for (uint m = 0; m < TMP; m++)
+        {
+            const uint r = pRow0 + m, t = tok0 + r / G, h = kvh * G + r % G;
+            if (t >= Tq || pSlot >= DH4) continue;
+            float l = 0.0;
+            [[unroll]] for (uint g = 0; g < KB; g++) l += sMax[g * R + r];
+            bufO[((b * Tq + t) * Hq + h) * DH4 + pSlot] = acc[m] / l;
+        }
+        return;
+    }
+    const uint tileId = (b * gl_NumWorkGroups.y + kvh) * (gl_NumWorkGroups.x / SPLIT) + tile;
+    const uint partML = gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z * R * DH4;
+    [[unroll]] for (uint m = 0; m < TMP; m++)
+    {
+        const uint r = pRow0 + m, pr = (tileId * SPLIT + split) * R + r;
+        float l = 0.0;
+        [[unroll]] for (uint g = 0; g < KB; g++) l += sMax[g * R + r];
+        if (pSlot < DH4) bufPart[pr * DH4 + pSlot] = acc[m];
+        if (pSlot == 0) bufPart[partML + pr] = vec4(sAlpha[r], l, 0.0, 0.0);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (tid == 0) sLast = atomicAdd(bufCnt[tileId], 1u) == SPLIT - 1u;
+    barrier();
+    if (!sLast) return;
+    memoryBarrierBuffer();
+
+    // the last split merges every part
+    [[unroll]] for (uint m = 0; m < TMP; m++)
+    {
+        const uint r = pRow0 + m, t = tok0 + r / G, h = kvh * G + r % G;
+        if (t >= Tq || pSlot >= DH4) continue;
+        float M = -1e30;
+        for (uint q = 0; q < SPLIT; q++) M = max(M, bufPart[partML + (tileId * SPLIT + q) * R + r].x);
+        vec4 o = vec4(0.0);
+        float l = 0.0;
+        for (uint q = 0; q < SPLIT; q++)
+        {
+            const uint pr = (tileId * SPLIT + q) * R + r;
+            const vec2 ml = bufPart[partML + pr].xy;
+            const float w = exp2(ml.x - M);
+            o += w * bufPart[pr * DH4 + pSlot];
+            l += w * ml.y;
+        }
+        bufO[((b * Tq + t) * Hq + h) * DH4 + pSlot] = o / l;
+    }
+    if (tid == 0) bufCnt[tileId] = 0u;
+}

@@ -1,0 +1,43 @@
+/*=============================================================================
+ rows-probe.comp: the W stream of linear-tile-11.comp without the math.
+     Workgroup g owns rows [g * ROWS, (g + 1) * ROWS) of a buffer whose rows
+     sit `stride4` vec4s apart. Per step it stages CHUNK4 vec4s of every one
+     of its rows into shared memory (slot s: row s / CHUNK4, vec4 s % CHUNK4,
+     as the kernel stages W) and waits on a barrier, then moves CHUNK4 vec4s
+     along the rows, `steps` times. With one wave of workgroups resident,
+     rows in flight = resident workgroups x ROWS.
+
+ Dispatch (host): (rows / ROWS, 1, 1)
+=============================================================================*/
+#version 450
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 256;
+layout(constant_id = 1) const uint ROWS   = 32;   // rows per workgroup
+layout(constant_id = 2) const uint CHUNK4 = 1;    // vec4s per row per step
+
+layout(set = 0, binding = 0) readonly buffer DATA_BUF { vec4 data[]; };
+layout(set = 0, binding = 1) writeonly buffer OUT_BUF { float outv[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint stride4;   // vec4s from one row to the next
+    uint steps;     // steps along a row
+};
+
+shared vec4 tile[ROWS * CHUNK4];
+
+void main()
+{
+    const uint row0 = gl_WorkGroupID.x * ROWS;
+    float acc = 0.0;
+    for (uint k = 0; k < steps; k++)
+    {
+        for (uint s = gl_LocalInvocationIndex; s < ROWS * CHUNK4; s += wgSize)
+            tile[s] = data[(row0 + s / CHUNK4) * stride4 + k * CHUNK4 + s % CHUNK4];
+        barrier();
+        acc += tile[(gl_LocalInvocationIndex + k) % (ROWS * CHUNK4)].x;
+        barrier();
+    }
+    outv[gl_WorkGroupID.x * wgSize + gl_LocalInvocationIndex] = acc;
+}

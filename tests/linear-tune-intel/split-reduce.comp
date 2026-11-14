@@ -1,0 +1,59 @@
+/*=============================================================================
+ split-reduce.comp: O[i] = sum over z of P[z, i], in fp32. Folds the
+     split-K partials linear-tile-10 / 11 write.
+
+     The same fold as Linear's linear-reduce.comp with no bias, residual,
+     activation or scale, and fp32 P and O: each invocation folds four
+     consecutive elements; the vec4 path needs the four in bounds and
+     MN % 4 == 0, otherwise the scalar loop covers them.
+
+ Dispatch (host): (ceil(M * N / (256 * 4)), 1, 1)
+=============================================================================*/
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF   { float bufferO[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_4 { vec4 bufferO_4[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF    { float bufferP[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF_4  { vec4 bufferP_4[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint MN;       // elements of O
+    uint splits;   // partial sets in P
+};
+
+void main()
+{
+    // Each invocation folds four consecutive elements.
+    const uint idx = gl_GlobalInvocationID.x * 4;
+
+    if (idx >= MN)
+        return;
+
+    if (idx + 3 < MN && MN % 4 == 0)
+    {
+        vec4 result = vec4(0.0);
+
+        [[unroll]] for (uint i = 0; i < splits; i++)
+            result += bufferP_4[(i * MN + idx) / 4];
+
+        bufferO_4[idx / 4] = result;
+    }
+    else
+    {
+        [[unroll]] for (uint j = 0; j < 4; ++j)
+        {
+            if (idx + j < MN)
+            {
+                float result = 0.0;
+
+                [[unroll]] for (uint i = 0; i < splits; i++)
+                    result += bufferP[i * MN + idx + j];
+
+                bufferO[idx + j] = result;
+            }
+        }
+    }
+}

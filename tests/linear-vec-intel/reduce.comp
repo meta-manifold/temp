@@ -1,0 +1,18 @@
+/*=============================================================================
+ reduce.comp: O[n] = sum_z P[z, n] over the split-K partials of vec.comp, fp32.
+
+ Dispatch (host): (ceil(N / 256), 1, 1).
+=============================================================================*/
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) writeonly buffer O_BUF { float bufferO[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF { float bufferP[]; };
+layout(push_constant) uniform PushConstants { uint N; uint splits; };
+void main()
+{
+    const uint n = gl_GlobalInvocationID.x;
+    if (n >= N) return;
+    float s = 0.0;
+    for (uint z = 0; z < splits; z++) s += bufferP[z * N + n];
+    bufferO[n] = s;
+}

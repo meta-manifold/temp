@@ -1,0 +1,31 @@
+/*=============================================================================
+ share-probe.comp: tells which workgroups in dispatch order land on the same
+     Xe-core. G workgroups read the same REGION (vec4s of a buffer, REPS
+     passes); the G sharers are STRIDE apart in dispatch order, all within a
+     block of G * STRIDE workgroups that run together. The same bytes are
+     read whatever the stride; when the sharers sit on one core the repeat
+     passes hit its L1, so the fastest stride tells who shares a core.
+=============================================================================*/
+#version 450
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 512;
+layout(constant_id = 1) const uint G      = 4;      // workgroups per region
+layout(constant_id = 2) const uint STRIDE = 1;      // distance between sharers in dispatch order
+layout(constant_id = 3) const uint REGION = 4096;   // vec4s per region
+layout(constant_id = 4) const uint REPS   = 8;      // passes over the region
+
+layout(set = 0, binding = 0) readonly buffer DATA_BUF { vec4 data[]; };
+layout(set = 0, binding = 1) writeonly buffer OUT_BUF { float outv[]; };
+
+void main()
+{
+    const uint id = gl_WorkGroupID.x;
+    const uint r  = (id / (G * STRIDE)) * STRIDE + id % STRIDE;
+    vec4 acc = vec4(0.0);
+    for (uint p = 0u; p < REPS; p++)
+        for (uint i = gl_LocalInvocationIndex; i < REGION; i += wgSize)
+            acc += data[r * REGION + i];
+    outv[id * wgSize + gl_LocalInvocationIndex] = acc.x + acc.y + acc.z + acc.w;
+}

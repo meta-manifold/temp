@@ -1,0 +1,286 @@
+/*=============================================================================
+ linear-tile-11-probe.comp: linear-tile-11.comp that records, per workgroup,
+     its start ticket, how many workgroups had finished by then, and its end
+     ticket (global atomic counters on binding 3), to reconstruct the order
+     and overlap the hardware actually ran the workgroups in. order 2 adds
+     the flat grid: x = mTile * tilesN + nTile, N-first, y = 1; order 3 the
+     flat grid M-first: x = nTile * tilesM + mTile.
+     probe[0] start counter, probe[1] end counter,
+     probe[2 + 8 * ((z * tilesM + mTile) * tilesN + nTile) + {0 .. 7}] = start, ended-before,
+     end, clocks in staging (global loads to the first barrier) and in
+     compute (first barrier to the second), each summed over K blocks, and
+     clocks from the first K block to the end (O stores and the last
+     barrier included), all on subgroup 0's clock; then that clock's raw
+     low word at the first K block and at the end.
+
+ linear-tile-11.comp: linear-tile-10.comp opened up for tuning across Intel
+     GPUs (Xe-LP / Xe-LPG at subgroup 8 / 16 / 32, Xe2 / Xe3 at 16 / 32) and
+     any shape. Over 10 it adds:
+       - aligned == 0: scalar masked loads, so K needs no multiple of KC or 4
+       - typeW: fp32 weights as well as fp16
+       - order: which dispatch axis walks M tiles
+       - WPAD: padding of the staged W columns (bank spreading)
+       - stageF32: fp32 shared memory and register caches, so I and W reach
+         the FMAs unrounded; it accumulates in fp32 whatever accType says
+
+     O[m, n] = sum_k I[m, k] * W[n, k]
+
+ One subgroup of SG lanes computes TM rows x (SG * TN) columns of O; lane j
+ owns columns nBase + c * SG + j (c < TN). Per K block of KC:
+   - the workgroup stages its I rows x KC into shared memory (coalesced)
+   - the workgroup stages its W columns x KC into shared memory (coalesced)
+   - each lane reads its own columns' KC slice from there into registers
+   - each subgroup walks its TM rows of the staged block at uniform addresses
+ The subgroups form a (subgroups / SGN) x SGN grid over M x N.
+
+ Split-K: workgroup z walks only the K span [z * splitSize, min(K,
+ (z + 1) * splitSize)) and stores its partial sums to P[z, M, N] on binding
+ 0; split-reduce.comp adds them. With one split it writes O directly.
+
+ Requirements: the pipeline's subgroup size equals SG; KC % 4 == 0;
+ splitSize % KC == 0. aligned == 1 also needs K % KC == 0.
+ Dispatch (host): order 0: (ceil(M / ROWS), ceil(N / COLS), splits)
+                  order 1: (ceil(N / COLS), ceil(M / ROWS), splits)
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_ARB_shader_clock : require
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0)  const uint wgSize   = 256;  // threads per workgroup (= local_size_x)
+layout(constant_id = 1)  const uint SG       = 16;   // subgroup size the pipeline is forced to
+layout(constant_id = 4)  const uint KC       = 8;    // k per staged block
+layout(constant_id = 6)  const uint WPAD     = 1;    // vec4 slots of padding per staged W column
+layout(constant_id = 7)  const uint TM       = 8;    // O rows per subgroup
+layout(constant_id = 8)  const uint TN       = 6;    // O columns per lane
+layout(constant_id = 9)  const uint SGN      = 1;    // subgroups along N in the workgroup
+layout(constant_id = 10) const uint order    = 0;    // 0: x walks M tiles, 1: x walks N tiles, 2: flat x, N-first, 3: flat x, M-first
+layout(constant_id = 11) const uint accType  = 1;    // accumulator dtype (0: fp32, 1: fp16); fp32 under stageF32
+layout(constant_id = 14) const uint stageF32 = 0;    // 1: fp32 shared memory and register caches
+
+layout(constant_id = SPEC_ID_TYPE_O)  const uint typeO   = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I)  const uint typeI   = 0;  // I (input) dtype
+layout(constant_id = SPEC_ID_TYPE_W)  const uint typeW   = 1;  // W (weight) dtype
+layout(constant_id = SPEC_ID_ALIGNED) const uint aligned = 1;  // 1: K % KC == 0, vec4 loads; 0: scalar masked loads
+
+const uint accF32 = (1u - accType) + accType * stageF32;   // fp32 accumulation: asked for, or forced by stageF32
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32  { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F16  { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_4F32 { vec4 bufferI_4f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_4F16 { f16vec4 bufferI_4f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer W_BUF_F32  { float bufferW_f32[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_F16  { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_4F32 { vec4 bufferW_4f32[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_4F16 { f16vec4 bufferW_4f16[]; };
+
+layout(set = 0, binding = 3) coherent buffer PROBE_BUF { uint probe[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint splitSize;   // K span per workgroup z (= K without splitting)
+};
+
+const uint SGS_M   = wgSize / SG / SGN;   // subgroups along M
+const uint ROWS    = SGS_M * TM;          // I rows the workgroup stages
+const uint KC4     = KC / 4;              // vec4 slots per staged row
+const uint COLS    = SGN * SG * TN;       // W columns the workgroup stages
+const uint WSTRIDE = KC4 + WPAD;          // vec4 slots per staged W column
+
+// One K block of I and W in 4-element slots held as raw bits: a fp16 slot is one
+// uvec2, a fp32 slot (stageF32) two. One array per operand keeps the fp16 layout
+// exactly linear-tile-10's; a second, dead fp32 array costs the fp16 path ~12%.
+const uint SLOT2 = 1u + stageF32;   // uvec2 per slot
+shared uvec2 tileI[ROWS * KC4 * SLOT2];
+shared uvec2 tileW[COLS * WSTRIDE * SLOT2];
+
+void    storeH(inout uvec2 dst, f16vec4 v) { dst = uvec2(packFloat2x16(v.xy), packFloat2x16(v.zw)); }
+f16vec4 loadH(uvec2 u)                     { return f16vec4(unpackFloat2x16(u.x), unpackFloat2x16(u.y)); }
+
+// 4 k values per read: in fp16 for fp16 staging (fp16 sources copy as they are),
+// in fp32 for fp32 staging (fp16 sources widen exactly).
+f16vec4 readI4h(uint i4) { return (typeI == DTYPE_F32) ? f16vec4(bufferI_4f32[i4]) : bufferI_4f16[i4]; }
+f16vec4 readW4h(uint i4) { return (typeW == DTYPE_F32) ? f16vec4(bufferW_4f32[i4]) : bufferW_4f16[i4]; }
+vec4    readI4f(uint i4) { return (typeI == DTYPE_F32) ? bufferI_4f32[i4] : vec4(bufferI_4f16[i4]); }
+vec4    readW4f(uint i4) { return (typeW == DTYPE_F32) ? bufferW_4f32[i4] : vec4(bufferW_4f16[i4]); }
+float   readI(uint i)    { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+float   readW(uint i)    { return (typeW == DTYPE_F32) ? bufferW_f32[i] : float(bufferW_f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+// 4 k values of row `row` from k, zero past endK (the scalar path, either staging dtype).
+vec4 readI4Masked(uint row, uint k, uint endK)
+{
+    vec4 v;
+    [[unroll]] for (uint e = 0; e < 4; e++)
+        v[e] = (k + e < endK) ? readI(row * K + k + e) : 0.0;
+    return v;
+}
+
+vec4 readW4Masked(uint col, uint k, uint endK)
+{
+    vec4 v;
+    [[unroll]] for (uint e = 0; e < 4; e++)
+        v[e] = (k + e < endK) ? readW(col * K + k + e) : 0.0;
+    return v;
+}
+
+void main()
+{
+    const uint tilesN = (N + COLS - 1) / COLS;
+    const uint tilesM = (M + ROWS - 1) / ROWS;
+    const uint mTile = (order == 0u) ? gl_WorkGroupID.x : (order == 1u) ? gl_WorkGroupID.y
+                     : (order == 2u) ? gl_WorkGroupID.x / tilesN : gl_WorkGroupID.x % tilesM;
+    const uint nTile = (order == 0u) ? gl_WorkGroupID.y : (order == 1u) ? gl_WorkGroupID.x
+                     : (order == 2u) ? gl_WorkGroupID.x % tilesN : gl_WorkGroupID.x / tilesM;
+
+    // Probe: start ticket and how many workgroups had ended by then.
+    const uint rec = 2u + 8u * ((gl_WorkGroupID.z * tilesM + mTile) * tilesN + nTile);   // split z outermost
+    uint staging = 0u, compute = 0u;
+    uint tFirst = 0u;
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        probe[rec]      = atomicAdd(probe[0], 1u);
+        probe[rec + 1u] = atomicAdd(probe[1], 0u);
+    }
+
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint sgM   = gl_SubgroupID / SGN;              // subgroup row in the grid
+    const uint row0  = mTile * ROWS;                     // the workgroup's first row
+    const uint col0  = nTile * COLS;                     // the workgroup's first column
+    const uint nLoc  = (gl_SubgroupID % SGN) * SG * TN;  // this subgroup's first column in the tile
+    const uint nBase = col0 + nLoc;
+
+    // Both accumulator and cache dtypes are declared; accF32 and stageF32 pick
+    // one each, and the dead arrays vanish at ISA compilation.
+    float16_t acc16[TM * TN];
+    float     acc32[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; i++) { acc16[i] = 0.0hf; acc32[i] = 0.0; }
+
+    // Split-K: workgroup z accumulates only its own K span.
+    const uint startK = gl_WorkGroupID.z * splitSize;
+    const uint endK   = min(K, startK + splitSize);
+
+    for (uint k0 = startK; k0 < endK; k0 += KC)
+    {
+        const uint ts = clock2x32ARB().x;
+        if (k0 == startK) tFirst = ts;
+        // Stage I[row0 .. row0 + ROWS, k0 .. k0 + KC): rows past M and k past endK zero.
+        for (uint s = gl_LocalInvocationID.x; s < ROWS * KC4; s += wgSize)
+        {
+            const uint r = s / KC4, q = s % KC4, row = row0 + r;
+            const uint i4 = (row * K + k0) / 4 + q;
+            if (stageF32 != 0)
+            {
+                const vec4 v = (row >= M) ? vec4(0.0) : (aligned != 0) ? readI4f(i4) : readI4Masked(row, k0 + q * 4, endK);
+                tileI[2 * s] = floatBitsToUint(v.xy);
+                tileI[2 * s + 1] = floatBitsToUint(v.zw);
+            }
+            else
+                storeH(tileI[s], (row >= M) ? f16vec4(0.0hf) : (aligned != 0) ? readI4h(i4) : f16vec4(readI4Masked(row, k0 + q * 4, endK)));
+        }
+
+        // Stage W[col0 .. col0 + COLS, k0 .. k0 + KC): columns past N and k past endK zero.
+        for (uint s = gl_LocalInvocationID.x; s < COLS * KC4; s += wgSize)
+        {
+            const uint c = s / KC4, q = s % KC4, col = col0 + c;
+            const uint i4 = (col * K + k0) / 4 + q;
+            const uint d = c * WSTRIDE + q;
+            if (stageF32 != 0)
+            {
+                const vec4 v = (col >= N) ? vec4(0.0) : (aligned != 0) ? readW4f(i4) : readW4Masked(col, k0 + q * 4, endK);
+                tileW[2 * d] = floatBitsToUint(v.xy);
+                tileW[2 * d + 1] = floatBitsToUint(v.zw);
+            }
+            else
+                storeH(tileW[d], (col >= N) ? f16vec4(0.0hf) : (aligned != 0) ? readW4h(i4) : f16vec4(readW4Masked(col, k0 + q * 4, endK)));
+        }
+
+        barrier();
+        const uint tb = clock2x32ARB().x;
+        staging += tb - ts;
+
+        // This lane's columns, k0 .. k0 + KC, into registers.
+        f16vec4 w16[TN * KC4];
+        vec4    w32[TN * KC4];
+        [[unroll]] for (uint c = 0; c < TN; c++)
+            [[unroll]] for (uint q = 0; q < KC4; q++)
+            {
+                const uint slot = (nLoc + c * SG + lane) * WSTRIDE + q;
+                if (stageF32 != 0) w32[c * KC4 + q] = vec4(uintBitsToFloat(tileW[2 * slot]), uintBitsToFloat(tileW[2 * slot + 1]));
+                else               w16[c * KC4 + q] = loadH(tileW[slot]);
+            }
+
+        // Each staged slot read is uniform across the subgroup: one broadcast, 4 k values.
+        [[unroll]] for (uint q = 0; q < KC4; q++)
+        {
+            [[unroll]] for (uint m = 0; m < TM; m++)
+            {
+                const uint slot = (sgM * TM + m) * KC4 + q;
+                if (stageF32 != 0)
+                {
+                    const vec4 a = vec4(uintBitsToFloat(tileI[2 * slot]), uintBitsToFloat(tileI[2 * slot + 1]));
+                    [[unroll]] for (uint c = 0; c < TN; c++)
+                    {
+                        const vec4 b = w32[c * KC4 + q];
+                        const uint i = m * TN + c;
+                        acc32[i] = fma(a.x, b.x, fma(a.y, b.y, fma(a.z, b.z, fma(a.w, b.w, acc32[i]))));
+                    }
+                }
+                else
+                {
+                    const f16vec4 a = loadH(tileI[slot]);
+                    [[unroll]] for (uint c = 0; c < TN; c++)
+                    {
+                        const f16vec4 b = w16[c * KC4 + q];
+                        const uint i = m * TN + c;
+                        if (accF32 == 0u)
+                            acc16[i] = fma(a.x, b.x, fma(a.y, b.y, fma(a.z, b.z, fma(a.w, b.w, acc16[i]))));
+                        else
+                            acc32[i] = fma(float(a.x), float(b.x), fma(float(a.y), float(b.y),
+                                       fma(float(a.z), float(b.z), fma(float(a.w), float(b.w), acc32[i]))));
+                    }
+                }
+            }
+        }
+
+        barrier();
+        compute += clock2x32ARB().x - tb;
+    }
+
+    const uint zOff = gl_WorkGroupID.z * M * N;   // partials of split z (0 without splitting)
+    [[unroll]] for (uint m = 0; m < TM; m++)
+    {
+        const uint row = row0 + sgM * TM + m;
+        [[unroll]] for (uint c = 0; c < TN; c++)
+        {
+            const uint n = nBase + c * SG + lane;
+            if (row < M && n < N)
+                writeO(zOff + row * N + n, (accF32 == 0u) ? float(acc16[m * TN + c]) : acc32[m * TN + c]);
+        }
+    }
+
+    // Probe: end ticket once every thread of the workgroup is done.
+    barrier();
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        probe[rec + 2u] = atomicAdd(probe[1], 1u);
+        probe[rec + 3u] = staging;
+        probe[rec + 4u] = compute;
+        const uint tEnd = clock2x32ARB().x;
+        probe[rec + 5u] = tEnd - tFirst;
+        probe[rec + 6u] = tFirst;
+        probe[rec + 7u] = tEnd;
+    }
+}

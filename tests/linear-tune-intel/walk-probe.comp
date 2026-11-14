@@ -1,0 +1,43 @@
+/*=============================================================================
+ walk-probe.comp: records the order the hardware runs a dispatch's
+     workgroups in. Each workgroup takes a start ticket, reads how many
+     workgroups had ended by then, spins on a fixed amount of register-only
+     math (no memory traffic, the same time for everyone), and takes an end
+     ticket. SLM_WORDS of shared memory per workgroup caps how many fit on a
+     core at once.
+
+     rec[0] start counter, rec[1] end counter, then per workgroup (linear id
+     x + y * numX): start, ended-before, end.
+=============================================================================*/
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize    = 512;
+layout(constant_id = 1) const uint ITERS     = 4096;   // spin length
+layout(constant_id = 2) const uint SLM_WORDS = 1;      // shared memory per workgroup, in uints
+
+layout(set = 0, binding = 0) coherent buffer REC_BUF { uint rec[]; };
+
+shared uint slm[SLM_WORDS];
+
+void main()
+{
+    const uint id = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        rec[2u + 3u * id]      = atomicAdd(rec[0], 1u);
+        rec[2u + 3u * id + 1u] = atomicAdd(rec[1], 0u);
+    }
+
+    // Same work for every workgroup: a dependent FMA chain per thread.
+    float v = float(gl_LocalInvocationIndex) * 1e-3;
+    for (uint i = 0u; i < ITERS; i++)
+        v = fma(v, 0.999, 0.001);
+    if (gl_LocalInvocationIndex < SLM_WORDS) slm[gl_LocalInvocationIndex] = floatBitsToUint(v);
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0u)
+        rec[2u + 3u * id + 2u] = atomicAdd(rec[1], 1u) + (slm[0] == 0xFFFFFFFFu ? 1u : 0u);   // slm read keeps it alive
+}

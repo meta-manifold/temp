@@ -1,0 +1,52 @@
+/*=============================================================================
+ slm-probe.comp: times the two shared-memory patterns of linear-tile-11's
+     W staging at a given row stride (STRIDE uvec2 slots per staged W row;
+     2 = unpadded at wgK 8, 3 = WPAD 1).
+     MODE 0 (read, step 3): lane reads slots (c * 16 + lane) * STRIDE + q,
+            c < TN, q < 2, 8 bytes each, as the lane loads its W columns.
+     MODE 1 (write, step 1): thread s writes slot (s / 2) * STRIDE + s % 2,
+            as the workgroup stages a W k-block.
+     The base moves every iteration so the accesses cannot be hoisted.
+=============================================================================*/
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize = 256;
+layout(constant_id = 1) const uint STRIDE = 2;     // uvec2 slots per staged row
+layout(constant_id = 2) const uint MODE   = 0;     // 0: read pattern, 1: write pattern
+layout(constant_id = 3) const uint ITERS  = 1024;
+layout(constant_id = 4) const uint TN     = 6;     // columns per lane (read pattern)
+layout(constant_id = 5) const uint OFF    = 0;     // uvec2 slots the pattern starts past a 64-byte boundary
+
+layout(set = 0, binding = 0) writeonly buffer OUT_BUF { uint outv[]; };
+
+const uint SPAN = 512u * 4u;   // slots touched by one iteration, at most
+shared uvec2 buf[SPAN + 8u * 64u];
+
+void main()
+{
+    const uint t = gl_LocalInvocationIndex, lane = gl_SubgroupInvocationID;
+    for (uint i = t; i < SPAN + 8u * 64u; i += wgSize) buf[i] = uvec2(i, i * 3u);
+    barrier();
+
+    uvec2 acc = uvec2(0u);
+    [[dont_unroll]] for (uint it = 0u; it < ITERS; it++)
+    {
+        const uint base = (it & 7u) * 64u + OFF;
+        if (MODE == 0u)
+        {
+            [[unroll]] for (uint c = 0u; c < TN; c++)
+                [[unroll]] for (uint q = 0u; q < 2u; q++)
+                    acc ^= buf[base + (c * 16u + lane) * STRIDE + q];
+        }
+        else
+        {
+            buf[base + (t / 2u) * STRIDE + t % 2u] = uvec2(it, t);
+        }
+    }
+    barrier();
+    outv[gl_GlobalInvocationID.x] = acc.x ^ acc.y ^ buf[t].x;
+}
